@@ -36,11 +36,15 @@ public class FieldConstant {
     
     public static final String APP_NAME = "app_name";
     
+    public static final String ENCRYPTED_DATA_KEY = "encrypted_data_key";
+    
     public static final String START_ROW = "startRow";
     
     public static final String PAGE_SIZE = "pageSize";
     
     public static final String ID = "id";
+
+    public static final String NID = "nid";
     
     public static final String START_TIME = "startTime";
     
@@ -77,6 +81,12 @@ public class FieldConstant {
     public static final String TYPE = "type";
     
     public static final String TAG_ID = "tagId";
+    
+    public static final String PUBLISH_TYPE = "publishType";
+    
+    public static final String GRAY_NAME = "grayName";
+    
+    public static final String GRAY_RULE = "grayRule";
     
     public static final String QUOTA = "quota";
     
