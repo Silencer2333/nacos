@@ -26,26 +26,32 @@ import com.alibaba.nacos.common.utils.NamespaceUtil;
 import com.alibaba.nacos.common.utils.Pair;
 import com.alibaba.nacos.common.utils.StringUtils;
 import com.alibaba.nacos.config.server.constant.Constants;
+import com.alibaba.nacos.config.server.constant.ParametersField;
 import com.alibaba.nacos.config.server.controller.parameters.SameNamespaceCloneConfigBean;
+import com.alibaba.nacos.config.server.enums.ApiVersionEnum;
 import com.alibaba.nacos.config.server.model.ConfigAdvanceInfo;
 import com.alibaba.nacos.config.server.model.ConfigAllInfo;
 import com.alibaba.nacos.config.server.model.ConfigInfo;
 import com.alibaba.nacos.config.server.model.ConfigInfo4Beta;
+import com.alibaba.nacos.config.server.model.ConfigInfoGrayWrapper;
 import com.alibaba.nacos.config.server.model.ConfigMetadata;
+import com.alibaba.nacos.config.server.model.ConfigRequestInfo;
 import com.alibaba.nacos.config.server.model.GroupkeyListenserStatus;
-import com.alibaba.nacos.persistence.model.Page;
 import com.alibaba.nacos.config.server.model.SameConfigPolicy;
 import com.alibaba.nacos.config.server.model.SampleResult;
 import com.alibaba.nacos.config.server.model.event.ConfigDataChangeEvent;
-import com.alibaba.nacos.config.server.model.ConfigRequestInfo;
 import com.alibaba.nacos.config.server.model.form.ConfigForm;
+import com.alibaba.nacos.config.server.model.gray.BetaGrayRule;
+import com.alibaba.nacos.config.server.model.gray.GrayRuleManager;
 import com.alibaba.nacos.config.server.monitor.MetricsMonitor;
+import com.alibaba.nacos.config.server.paramcheck.ConfigBlurSearchHttpParamExtractor;
+import com.alibaba.nacos.config.server.paramcheck.ConfigDefaultHttpParamExtractor;
+import com.alibaba.nacos.config.server.paramcheck.ConfigListenerHttpParamExtractor;
 import com.alibaba.nacos.config.server.result.code.ResultCodeEnum;
 import com.alibaba.nacos.config.server.service.ConfigChangePublisher;
 import com.alibaba.nacos.config.server.service.ConfigOperationService;
 import com.alibaba.nacos.config.server.service.ConfigSubService;
-import com.alibaba.nacos.core.namespace.repository.NamespacePersistService;
-import com.alibaba.nacos.config.server.service.repository.ConfigInfoBetaPersistService;
+import com.alibaba.nacos.config.server.service.repository.ConfigInfoGrayPersistService;
 import com.alibaba.nacos.config.server.service.repository.ConfigInfoPersistService;
 import com.alibaba.nacos.config.server.service.trace.ConfigTraceService;
 import com.alibaba.nacos.config.server.utils.GroupKey;
@@ -56,12 +62,16 @@ import com.alibaba.nacos.config.server.utils.TimeUtils;
 import com.alibaba.nacos.config.server.utils.YamlParserUtil;
 import com.alibaba.nacos.config.server.utils.ZipUtils;
 import com.alibaba.nacos.core.control.TpsControl;
+import com.alibaba.nacos.core.namespace.repository.NamespacePersistService;
+import com.alibaba.nacos.core.paramcheck.ExtractorManager;
+import com.alibaba.nacos.persistence.model.Page;
 import com.alibaba.nacos.plugin.auth.constant.ActionTypes;
 import com.alibaba.nacos.plugin.auth.constant.SignType;
 import com.alibaba.nacos.plugin.encryption.handler.EncryptionHandler;
 import com.alibaba.nacos.sys.utils.InetUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.BeanUtils;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -100,6 +110,7 @@ import static com.alibaba.nacos.config.server.utils.RequestUtil.getRemoteIp;
  */
 @RestController
 @RequestMapping(Constants.CONFIG_CONTROLLER_PATH)
+@ExtractorManager.Extractor(httpExtractor = ConfigDefaultHttpParamExtractor.class)
 public class ConfigController {
     
     private static final Logger LOGGER = LoggerFactory.getLogger(ConfigController.class);
@@ -114,7 +125,7 @@ public class ConfigController {
     
     private ConfigInfoPersistService configInfoPersistService;
     
-    private ConfigInfoBetaPersistService configInfoBetaPersistService;
+    private ConfigInfoGrayPersistService configInfoGrayPersistService;
     
     private NamespacePersistService namespacePersistService;
     
@@ -125,13 +136,13 @@ public class ConfigController {
     public ConfigController(ConfigServletInner inner, ConfigOperationService configOperationService,
             ConfigSubService configSubService, ConfigInfoPersistService configInfoPersistService,
             NamespacePersistService namespacePersistService,
-            ConfigInfoBetaPersistService configInfoBetaPersistService) {
+            ConfigInfoGrayPersistService configInfoGrayPersistService) {
         this.inner = inner;
         this.configOperationService = configOperationService;
         this.configSubService = configSubService;
         this.configInfoPersistService = configInfoPersistService;
         this.namespacePersistService = namespacePersistService;
-        this.configInfoBetaPersistService = configInfoBetaPersistService;
+        this.configInfoGrayPersistService = configInfoGrayPersistService;
     }
     
     /**
@@ -171,6 +182,7 @@ public class ConfigController {
         }
         
         // check tenant
+        tenant = NamespaceUtil.processNamespaceParameter(tenant);
         ParamUtils.checkTenant(tenant);
         ParamUtils.checkParam(dataId, group, "datumId", content);
         ParamUtils.checkParam(tag);
@@ -189,7 +201,6 @@ public class ConfigController {
         configForm.setEffect(effect);
         configForm.setType(type);
         configForm.setSchema(schema);
-        
         if (StringUtils.isBlank(srcUser)) {
             configForm.setSrcUser(RequestUtil.getSrcUserName(request));
         }
@@ -201,6 +212,7 @@ public class ConfigController {
         configRequestInfo.setSrcIp(RequestUtil.getRemoteIp(request));
         configRequestInfo.setRequestIpApp(RequestUtil.getAppName(request));
         configRequestInfo.setBetaIps(request.getHeader("betaIps"));
+        configRequestInfo.setCasMd5(request.getHeader("casMd5"));
         
         return configOperationService.publishConfig(configForm, configRequestInfo, encryptedDataKeyFinal);
     }
@@ -229,7 +241,7 @@ public class ConfigController {
         
         final String clientIp = RequestUtil.getRemoteIp(request);
         String isNotify = request.getHeader("notify");
-        inner.doGetConfig(request, response, dataId, group, tenant, tag, isNotify, clientIp);
+        inner.doGetConfig(request, response, dataId, group, tenant, tag, isNotify, clientIp, ApiVersionEnum.V1);
     }
     
     /**
@@ -299,15 +311,16 @@ public class ConfigController {
     @Secured(action = ActionTypes.WRITE, signType = SignType.CONFIG)
     public RestResult<Boolean> deleteConfigs(HttpServletRequest request, @RequestParam(value = "ids") List<Long> ids) {
         String clientIp = RequestUtil.getRemoteIp(request);
+        String srcUser = RequestUtil.getSrcUserName(request);
         final Timestamp time = TimeUtils.getCurrentTime();
-        List<ConfigInfo> configInfoList = configInfoPersistService.removeConfigInfoByIds(ids, clientIp, null);
+        List<ConfigAllInfo> configInfoList = configInfoPersistService.removeConfigInfoByIds(ids, clientIp, srcUser);
         if (CollectionUtils.isEmpty(configInfoList)) {
             return RestResultUtils.success(true);
         }
-        for (ConfigInfo configInfo : configInfoList) {
+        for (ConfigAllInfo configInfo : configInfoList) {
             ConfigChangePublisher.notifyConfigChange(
-                    new ConfigDataChangeEvent(false, configInfo.getDataId(), configInfo.getGroup(),
-                            configInfo.getTenant(), time.getTime()));
+                    new ConfigDataChangeEvent(configInfo.getDataId(), configInfo.getGroup(), configInfo.getTenant(),
+                            time.getTime()));
             
             ConfigTraceService.logPersistenceEvent(configInfo.getDataId(), configInfo.getGroup(),
                     configInfo.getTenant(), null, time.getTime(), clientIp, ConfigTraceService.PERSISTENCE_EVENT,
@@ -330,6 +343,7 @@ public class ConfigController {
      */
     @PostMapping("/listener")
     @Secured(action = ActionTypes.READ, signType = SignType.CONFIG)
+    @ExtractorManager.Extractor(httpExtractor = ConfigListenerHttpParamExtractor.class)
     public void listener(HttpServletRequest request, HttpServletResponse response)
             throws ServletException, IOException {
         
@@ -376,6 +390,7 @@ public class ConfigController {
      */
     @GetMapping(params = "search=accurate")
     @Secured(action = ActionTypes.READ, signType = SignType.CONFIG)
+    @ExtractorManager.Extractor(httpExtractor = ConfigBlurSearchHttpParamExtractor.class)
     public Page<ConfigInfo> searchConfig(@RequestParam("dataId") String dataId, @RequestParam("group") String group,
             @RequestParam(value = "appName", required = false) String appName,
             @RequestParam(value = "tenant", required = false, defaultValue = StringUtils.EMPTY) String tenant,
@@ -404,11 +419,13 @@ public class ConfigController {
      */
     @GetMapping(params = "search=blur")
     @Secured(action = ActionTypes.READ, signType = SignType.CONFIG)
+    @ExtractorManager.Extractor(httpExtractor = ConfigBlurSearchHttpParamExtractor.class)
     public Page<ConfigInfo> fuzzySearchConfig(@RequestParam("dataId") String dataId,
             @RequestParam("group") String group, @RequestParam(value = "appName", required = false) String appName,
             @RequestParam(value = "tenant", required = false, defaultValue = StringUtils.EMPTY) String tenant,
             @RequestParam(value = "config_tags", required = false) String configTags,
-            @RequestParam("pageNo") int pageNo, @RequestParam("pageSize") int pageSize) {
+            @RequestParam(value = "types", required = false) String types, @RequestParam("pageNo") int pageNo,
+            @RequestParam("pageSize") int pageSize) {
         MetricsMonitor.getFuzzySearchMonitor().incrementAndGet();
         Map<String, Object> configAdvanceInfo = new HashMap<>(50);
         if (StringUtils.isNotBlank(appName)) {
@@ -416,6 +433,9 @@ public class ConfigController {
         }
         if (StringUtils.isNotBlank(configTags)) {
             configAdvanceInfo.put("config_tags", configTags);
+        }
+        if (StringUtils.isNotBlank(types)) {
+            configAdvanceInfo.put(ParametersField.TYPES, types);
         }
         try {
             return configInfoPersistService.findConfigInfoLike4Page(pageNo, pageSize, dataId, group, tenant,
@@ -439,20 +459,16 @@ public class ConfigController {
     @Secured(action = ActionTypes.WRITE, signType = SignType.CONFIG)
     public RestResult<Boolean> stopBeta(HttpServletRequest httpServletRequest,
             @RequestParam(value = "dataId") String dataId, @RequestParam(value = "group") String group,
-            @RequestParam(value = "tenant", required = false, defaultValue = StringUtils.EMPTY) String tenant) {
+            @RequestParam(value = "tenant", required = false, defaultValue = StringUtils.EMPTY) String tenant,
+            @RequestParam(value = "srcUser", required = false, defaultValue = StringUtils.EMPTY) String srcUser) {
         String remoteIp = getRemoteIp(httpServletRequest);
-        String requestIpApp = RequestUtil.getAppName(httpServletRequest);
         try {
-            configInfoBetaPersistService.removeConfigInfo4Beta(dataId, group, tenant);
+            
+            configOperationService.deleteConfig(dataId, group, tenant, BetaGrayRule.TYPE_BETA, remoteIp, srcUser);
         } catch (Throwable e) {
             LOGGER.error("remove beta data error", e);
             return RestResultUtils.failed(500, false, "remove beta data error");
         }
-        ConfigTraceService.logPersistenceEvent(dataId, group, tenant, requestIpApp, System.currentTimeMillis(),
-                remoteIp, ConfigTraceService.PERSISTENCE_EVENT_BETA, ConfigTraceService.PERSISTENCE_TYPE_REMOVE, null);
-        ConfigChangePublisher.notifyConfigChange(
-                new ConfigDataChangeEvent(true, dataId, group, tenant, System.currentTimeMillis()));
-        
         return RestResultUtils.success("stop beta ok", true);
     }
     
@@ -470,14 +486,21 @@ public class ConfigController {
             @RequestParam(value = "group") String group,
             @RequestParam(value = "tenant", required = false, defaultValue = StringUtils.EMPTY) String tenant) {
         try {
-            ConfigInfo4Beta ci = configInfoBetaPersistService.findConfigInfo4Beta(dataId, group, tenant);
             
-            if (Objects.nonNull(ci)) {
-                String encryptedDataKey = ci.getEncryptedDataKey();
-                Pair<String, String> pair = EncryptionHandler.decryptHandler(dataId, encryptedDataKey, ci.getContent());
-                ci.setContent(pair.getSecond());
+            ConfigInfo4Beta configInfo4Beta = null;
+            ConfigInfoGrayWrapper beta4Gray = configInfoGrayPersistService.findConfigInfo4Gray(dataId, group, tenant,
+                    "beta");
+            if (Objects.nonNull(beta4Gray)) {
+                String encryptedDataKey = beta4Gray.getEncryptedDataKey();
+                Pair<String, String> pair = EncryptionHandler.decryptHandler(dataId, encryptedDataKey,
+                        beta4Gray.getContent());
+                beta4Gray.setContent(pair.getSecond());
+                configInfo4Beta = new ConfigInfo4Beta();
+                BeanUtils.copyProperties(beta4Gray, configInfo4Beta);
+                configInfo4Beta.setBetaIps(
+                        GrayRuleManager.deserializeConfigGrayPersistInfo(beta4Gray.getGrayRule()).getExpr());
             }
-            return RestResultUtils.success("query beta ok", ci);
+            return RestResultUtils.success("query beta ok", configInfo4Beta);
         } catch (Throwable e) {
             LOGGER.error("query beta data error", e);
             return RestResultUtils.failed("query beta data error");
@@ -616,6 +639,9 @@ public class ConfigController {
             failedData.put("succCount", 0);
             return RestResultUtils.buildResult(ResultCodeEnum.NAMESPACE_NOT_EXIST, failedData);
         }
+        if (StringUtils.isBlank(srcUser)) {
+            srcUser = RequestUtil.getSrcUserName(request);
+        }
         List<ConfigAllInfo> configInfoList = new ArrayList<>();
         List<Map<String, String>> unrecognizedList = new ArrayList<>();
         try {
@@ -624,9 +650,9 @@ public class ConfigController {
             RestResult<Map<String, Object>> errorResult;
             if (metaDataZipItem != null && Constants.CONFIG_EXPORT_METADATA_NEW.equals(metaDataZipItem.getItemName())) {
                 // new export
-                errorResult = parseImportDataV2(unziped, configInfoList, unrecognizedList, namespace);
+                errorResult = parseImportDataV2(srcUser, unziped, configInfoList, unrecognizedList, namespace);
             } else {
-                errorResult = parseImportData(unziped, configInfoList, unrecognizedList, namespace);
+                errorResult = parseImportData(srcUser, unziped, configInfoList, unrecognizedList, namespace);
             }
             if (errorResult != null) {
                 return errorResult;
@@ -648,8 +674,8 @@ public class ConfigController {
                 null, policy);
         for (ConfigInfo configInfo : configInfoList) {
             ConfigChangePublisher.notifyConfigChange(
-                    new ConfigDataChangeEvent(false, configInfo.getDataId(), configInfo.getGroup(),
-                            configInfo.getTenant(), time.getTime()));
+                    new ConfigDataChangeEvent(configInfo.getDataId(), configInfo.getGroup(), configInfo.getTenant(),
+                            time.getTime()));
             ConfigTraceService.logPersistenceEvent(configInfo.getDataId(), configInfo.getGroup(),
                     configInfo.getTenant(), requestIpApp, time.getTime(), InetUtils.getSelfIP(),
                     ConfigTraceService.PERSISTENCE_EVENT, ConfigTraceService.PERSISTENCE_TYPE_PUB,
@@ -672,7 +698,7 @@ public class ConfigController {
      * @param namespace        import namespace.
      * @return error result.
      */
-    private RestResult<Map<String, Object>> parseImportData(ZipUtils.UnZipResult unziped,
+    private RestResult<Map<String, Object>> parseImportData(String srcUser, ZipUtils.UnZipResult unziped,
             List<ConfigAllInfo> configInfoList, List<Map<String, String>> unrecognizedList, String namespace) {
         ZipUtils.ZipItem metaDataZipItem = unziped.getMetaDataItem();
         
@@ -725,6 +751,7 @@ public class ConfigController {
                 }
                 ci.setTenant(namespace);
                 ci.setEncryptedDataKey(pair.getFirst());
+                ci.setCreateUser(srcUser);
                 configInfoList.add(ci);
             }
         }
@@ -740,7 +767,7 @@ public class ConfigController {
      * @param namespace        import namespace.
      * @return error result.
      */
-    private RestResult<Map<String, Object>> parseImportDataV2(ZipUtils.UnZipResult unziped,
+    private RestResult<Map<String, Object>> parseImportDataV2(String srcUser, ZipUtils.UnZipResult unziped,
             List<ConfigAllInfo> configInfoList, List<Map<String, String>> unrecognizedList, String namespace) {
         ZipUtils.ZipItem metaDataItem = unziped.getMetaDataItem();
         String metaData = metaDataItem.getItemData();
@@ -816,6 +843,7 @@ public class ConfigController {
             ci.setAppName(configExportItem.getAppName());
             ci.setTenant(namespace);
             ci.setEncryptedDataKey(pair.getFirst());
+            ci.setCreateUser(srcUser);
             configInfoList.add(ci);
         }
         return null;
@@ -888,7 +916,9 @@ public class ConfigController {
                     ci.getEncryptedDataKey() == null ? StringUtils.EMPTY : ci.getEncryptedDataKey());
             configInfoList4Clone.add(ci4save);
         }
-        
+        if (StringUtils.isBlank(srcUser)) {
+            srcUser = RequestUtil.getSrcUserName(request);
+        }
         final String srcIp = RequestUtil.getRemoteIp(request);
         String requestIpApp = RequestUtil.getAppName(request);
         final Timestamp time = TimeUtils.getCurrentTime();
@@ -896,8 +926,8 @@ public class ConfigController {
                 srcIp, null, policy);
         for (ConfigInfo configInfo : configInfoList4Clone) {
             ConfigChangePublisher.notifyConfigChange(
-                    new ConfigDataChangeEvent(false, configInfo.getDataId(), configInfo.getGroup(),
-                            configInfo.getTenant(), time.getTime()));
+                    new ConfigDataChangeEvent(configInfo.getDataId(), configInfo.getGroup(), configInfo.getTenant(),
+                            time.getTime()));
             ConfigTraceService.logPersistenceEvent(configInfo.getDataId(), configInfo.getGroup(),
                     configInfo.getTenant(), requestIpApp, time.getTime(), InetUtils.getSelfIP(),
                     ConfigTraceService.PERSISTENCE_EVENT, ConfigTraceService.PERSISTENCE_TYPE_PUB,
